@@ -1,0 +1,21 @@
+# API & server
+fastapi==0.115.0
+uvicorn==0.30.6
+pydantic==2.9.2
+
+# Data collection
+requests==2.32.3
+python-dotenv==1.0.1
+
+# Data processing
+pandas==2.2.3
+numpy==2.1.1
+
+# Machine learning & feature selection
+scikit-learn==1.5.2
+joblib==1.4.2
+
+# Notebook & visualization (not needed in Docker, but required for notebooks/)
+matplotlib==3.9.2
+seaborn==0.13.2
+jupyter==1.1.1

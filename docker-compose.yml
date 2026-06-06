@@ -1,0 +1,9 @@
+services:
+  churn-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
