@@ -36,7 +36,7 @@ def get_usernames(count: int = 300, since: int = 0) -> list[str]:
             r = requests.get(
                 f"{BASE_URL}/users",
                 headers=headers,
-                params={"since": since, "per_page": 100},
+                params={"since": since, "per_page": count},
                 timeout=10,
             )
             r.raise_for_status()
@@ -50,15 +50,43 @@ def get_usernames(count: int = 300, since: int = 0) -> list[str]:
             break
 
         usernames += [u["login"] for u in batch]
-        since = batch[-1]["id"]
+        since = batch[-1]["id"]*1000
 
         remaining = r.headers.get("X-RateLimit-Remaining", "?")
         print(f"[scraper] Collected {len(usernames)} usernames | rate limit remaining: {remaining}")
 
-        time.sleep(0.5)
+        time.sleep(0.7)
 
     return usernames[:count]
 
+
+
+def get_usernames_spread(total: int = 900) -> list[str]:
+    """
+    Samples usernames from different points in GitHub's user ID space
+    to get a mix of old and new accounts — avoids the 2008 bias.
+    """
+    # GitHub user IDs go up to ~150M+
+    # sample from 6 different eras evenly
+    checkpoints = [
+        0,          # 2008 — founders era
+        1_000_000,  # ~2012
+        5_000_000,  # ~2013
+        20_000_000, # ~2015
+        50_000_000, # ~2017
+        100_000_000 # ~2021
+    ]
+
+    per_checkpoint = total // len(checkpoints)
+    usernames = []
+
+    for since in checkpoints:
+        print(f"[scraper] Sampling {per_checkpoint} users from ID {since:,}...")
+        batch = get_usernames(count=per_checkpoint, since=since)
+        usernames += batch
+        time.sleep(1)
+
+    return usernames[:total]
 
 # ──────────────────────────────────────────────
 # Step 2 — fetch full profile for each username
@@ -115,7 +143,7 @@ def fetch_all_users(count: int = 300, since: int = 0) -> pd.DataFrame:
     Saves a checkpoint to data/raw/users_raw.csv after every 50 users
     so you don't lose progress if the script crashes mid-run.
     """
-    usernames = get_usernames(count=count, since=since)
+    usernames = get_usernames_spread()
     records = []
 
     print(f"\n[scraper] Fetching profiles for {len(usernames)} users...")
@@ -132,7 +160,7 @@ def fetch_all_users(count: int = 300, since: int = 0) -> pd.DataFrame:
         # checkpoint every 50 users
         if (i + 1) % 50 == 0:
             checkpoint = pd.DataFrame(records)
-            checkpoint.to_csv("data/raw/users_raw_checkpoint.csv", index=False)
+            checkpoint.to_json("data/raw/users_raw_checkpoint.json", index=False)
             print(f"[scraper] Checkpoint saved — {len(records)} profiles collected so far")
 
     df = pd.DataFrame(records)
@@ -146,6 +174,31 @@ def fetch_all_users(count: int = 300, since: int = 0) -> pd.DataFrame:
 
     print(f"\n[scraper] Done. {len(df)} clean profiles collected.")
     return df
+
+
+# ──────────────────────────────────────────────
+# Loader — use this instead of fetch_all_users()
+# once you already have the JSON file saved
+# ──────────────────────────────────────────────
+ 
+def load_raw_data(path: str = "data/raw/users_raw.json") -> pd.DataFrame:
+    """
+    Loads the saved JSON file produced by the scraper into a DataFrame.
+    Use this in your notebook and model.py instead of fetch_all_users()
+    so you don't re-hit the API every time.
+ 
+    Usage:
+        from app.scraper import load_raw_data
+        df = load_raw_data()
+    """
+ 
+    df = pd.read_json(path)
+ 
+    print(f"[scraper] Loaded {len(df)} records from {path}")
+    print(f"[scraper] Null counts:\n{df.isnull().sum()}\n")
+ 
+    return df
+
 
 
 # ──────────────────────────────────────────────

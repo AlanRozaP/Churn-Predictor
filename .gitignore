@@ -2,3 +2,4 @@
 .python-version
 .venv
 data/
+__pycache__
