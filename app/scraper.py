@@ -411,7 +411,7 @@ def fetch_user_profile(username: str) -> dict | None:
 
     # ── 2. graphql contributions (1-year rolling window) ─────────────────
     contribs = _fetch_contributions(username, created_at)
-    time.sleep(0.4)
+    time.sleep(0.2)
 
     # ── 3. PR counts via Search API (all-time, consistent window) ─────────
     prs_opened, prs_merged = _fetch_pr_counts(username)
@@ -423,7 +423,7 @@ def fetch_user_profile(username: str) -> dict | None:
         # No public events in 90 days — user is almost certainly churned.
         # Fall back to profile-level updated_at as the best available signal.
         last_activity_at = profile.get("updated_at")
-    time.sleep(0.3)
+    time.sleep(0.2)
 
     # ── 5. org membership ─────────────────────────────────────────────────
     org_count = _fetch_org_count(username)
@@ -474,7 +474,7 @@ def fetch_all_users(count: int = 900) -> pd.DataFrame:
     records: list[dict] = []
 
     print(f"\n[scraper] Fetching profiles for {len(usernames)} users...")
-    print(f"[scraper] Estimated wall time: ~{len(usernames) * 9 / 60:.0f} min (search API is the bottleneck)")
+    print(f"[scraper] Estimated wall time: ~{len(usernames) * 6 / 60:.0f} min (search API is the bottleneck)")
 
     for i, username in enumerate(usernames):
         profile = fetch_user_profile(username)
@@ -534,11 +534,11 @@ def load_raw_data(path: str = "data/raw/users_raw.json") -> pd.DataFrame:
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
-    os.makedirs("data/raw", exist_ok=True)
+    os.makedirs("../data/raw", exist_ok=True)
 
-    df = fetch_all_users(count=900)
+    df = fetch_all_users(count=90)
 
-    output_path = "data/raw/users_raw.json"
+    output_path = "../data/raw/users_raw.json"
     df.to_json(output_path, orient="records", indent=2)
 
     print(f"\n[scraper] Raw data saved to {output_path}")
