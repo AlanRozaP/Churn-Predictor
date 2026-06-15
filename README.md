@@ -3,7 +3,18 @@
 **Introduction to Data Science — Final Project**  
 Information Engineering | Prof. Yrupe Fresco
 
-A fully Dockerized web application that predicts GitHub user churn using behavioral features engineered from the GitHub REST API. The project covers the full data science pipeline: data collection, feature engineering, feature selection (4 methods), model training, and deployment via a FastAPI REST endpoint.
+A fully Dockerized web application that predicts GitHub user churn using **14 behavioral features** engineered from the **GitHub REST + GraphQL APIs**. The project covers the full data science pipeline: data collection, feature engineering, feature selection (4 methods), model training, and deployment via a FastAPI REST endpoint.
+
+---
+
+**Description rewritten based on current `app/scraper.py`, `app/features.py`, and `notebooks/eda_and_selection.ipynb`.**  
+
+| Old (README v1.0) | Current (refactored codebase) |
+|---|---|
+| 8 features | **14 features** — added per-event recency gaps, velocity, inactivity streak, repo density |
+| Churn threshold `180 days` | **30 days** — aligned with GitHub public events API (~30d window) |
+| Dataset size `300` users | **900** users (or as available in `users_raw.json`) |
+| Raw fields `8` | **18** raw fields — added per-type timestamps, PR/social/activity/structural signals |
 
 ---
 
@@ -36,7 +47,7 @@ churn-predictor/
 │   └── eda_and_selection.ipynb   # EDA, all 4 selection methods, comparison table
 ├── data/
 │   └── raw/
-│       └── users_raw.json        # Raw GitHub profiles (600+ users)
+│   └── users_raw.json        # Raw GitHub profiles (381+ users) — 18 raw fields → 14 engineered
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -48,18 +59,29 @@ churn-predictor/
 ## API Endpoints
 
 ### `POST /predict`
+
 Accepts raw GitHub profile fields and returns a churn prediction.
 
 **Request body:**
 ```json
 {
-  "updated_at":   "2022-01-01T00:00:00Z",
-  "created_at":   "2018-01-01T00:00:00Z",
-  "followers":    5,
-  "following":    50,
-  "public_repos": 2,
-  "public_gists": 0,
-  "bio":          null
+    "created_at":       "2018-01-01T00:00:00Z",
+    "last_activity_at": "2022-01-01T00:00:00Z",
+    "last_push_at":     "2022-01-01T00:00:00Z",
+    "last_pr_at":       None,
+    "last_issue_at":    None,
+    "last_comment_at":  None,
+    "prs_merged":       3,
+    "prs_opened":       5,
+    "issue_comments":   10,
+    "pr_comments":      2,
+    "total_commits":    100,
+    "events_30d":       0,
+    "distinct_repos":   4,
+    "activity_dates":   [],
+    "org_count":        1,
+    "ssh_key_count":    1,
+    "gpg_key_count":    0
 }
 ```
 
@@ -67,18 +89,7 @@ Accepts raw GitHub profile fields and returns a churn prediction.
 ```json
 {
   "churned": true,
-  "churn_probability": 0.847,
-  "risk_level": "high",
-  "features_used": [
-    "days_since_last_activity",
-    "account_age_days",
-    "follower_ratio",
-    "inactive_ratio",
-    "repos_per_year",
-    "total_engagement_score",
-    "has_no_repos",
-    "has_bio"
-  ]
+  "churn_probability": 0.73
 }
 ```
 
@@ -87,14 +98,24 @@ Accepts raw GitHub profile fields and returns a churn prediction.
 curl -X POST http://localhost:8000/predict \
      -H "Content-Type: application/json" \
      -d '{
-       "updated_at":   "2022-01-01T00:00:00Z",
-       "created_at":   "2018-01-01T00:00:00Z",
-       "followers":    5,
-       "following":    50,
-       "public_repos": 2,
-       "public_gists": 0,
-       "bio":          null
-     }'
+    "created_at":       "2018-01-01T00:00:00Z",
+    "last_activity_at": "2022-01-01T00:00:00Z",
+    "last_push_at":     "2022-01-01T00:00:00Z",
+    "last_pr_at":       None,
+    "last_issue_at":    None,
+    "last_comment_at":  None,
+    "prs_merged":       3,
+    "prs_opened":       5,
+    "issue_comments":   10,
+    "pr_comments":      2,
+    "total_commits":    100,
+    "events_30d":       0,
+    "distinct_repos":   4,
+    "activity_dates":   [],
+    "org_count":        1,
+    "ssh_key_count":    1,
+    "gpg_key_count":    0
+}'
 ```
 
 ### `GET /health`
@@ -107,34 +128,40 @@ Returns the list of features the model expects and the churn threshold used duri
 
 ## Features
 
-All 8 features are derived from raw GitHub API fields. Raw fields are never passed directly to the model.
+All **14** features are derived from **18** raw GitHub API fields. Raw fields are never passed directly to the model.
 
 | Feature | Type | Raw Field(s) | Reasoning |
 |---|---|---|---|
-| `days_since_last_activity` | Time-based | `updated_at` | Primary recency signal — the strongest churn predictor |
-| `account_age_days` | Time-based | `created_at` | Context for all other features |
-| `follower_ratio` | Ratio | `followers / (following + 1)` | Social embeddedness — isolated users churn more |
-| `inactive_ratio` | Ratio | `days_inactive / account_age` | Proportion of account life that has been silent |
-| `repos_per_year` | Aggregation | `public_repos / (age / 365)` | Productivity normalised by tenure |
-| `total_engagement_score` | Aggregation | `followers + repos + gists` | Composite volume signal |
-| `has_no_repos` | Binary | `public_repos == 0` | Never properly onboarded |
-| `has_bio` | Binary | `bio != null` | Profile investment signals lower churn risk |
+| `pr_success_rate` | Ratio | `prs_merged / (prs_opened + 1)` | Low acceptance → repeated rejections → higher abandonment risk |
+| `social_engagement_ratio` | Ratio | `(issue_comments + pr_comments) / (total_commits + total_social + 1)` | Community member vs isolated “solo coder” |
+| `recency_gap` | Time-based | `last_activity_at` | Overall days since last activity of ANY type |
+| `recency_gap_push` | Time-based | `last_push_at` | Days since last code push |
+| `recency_gap_pr` | Time-based | `last_pr_at` | Days since last pull request |
+| `recency_gap_issue` | Time-based | `last_issue_at` | Days since last issue activity |
+| `recency_gap_comment` | Time-based | `last_comment_at` | Days since last comment / review |
+| `max_inactivity_streak` | Time-based | `activity_dates` | Longest consecutive gap between events in the ~30d window |
+| `recent_velocity` | Aggregation | `events_30d` | Short-term engagement (events in trailing ~30 days) |
+| `commit_velocity_1y` | Aggregation | `total_commits / 365` | Historical commit pace (1-year GraphQL baseline) |
+| `velocity_drop` | Aggregation | `commit_velocity_1y - (events_30d / 30)` | Deceleration: recent activity below historical baseline |
+| `repo_density` | Aggregation | `distinct_repos / (account_age_years + 0.01)` | Diverse ecosystem involvement |
+| `is_org_member` | Binary | `org_count > 0` | Professional/community integration lowers churn risk |
+| `has_secure_profile` | Binary | `ssh_key_count + gpg_key_count > 0` | SSH/GPG keys proxy development maturity |
 
 ---
 
 ## Churn Label
 
-A user is labelled as **churned (1)** if their GitHub account shows no activity for more than **180 days**, based on the `updated_at` field.
+A user is labelled as **churned (1)** only if **all** of the following conditions are met:
 
-This threshold was selected empirically:
+1. **No public events for > 30 days** — measured via `recency_gap` (days since any public event). This threshold aligns with the GitHub public events API, which reliably returns only the last ~30 days of activity.
+2. **Historically active** — proven by at least one of: `total_commits > 0`, `prs_opened > 0`, `issue_comments > 0`, or `distinct_repos > 0`. This prevents labelling never-active or dormant accounts as churned.
+3. **Mature account** — `account_age_days > 30`. This avoids misclassifying brand-new signups with zero activity.
 
-| Threshold | Churned % | Assessment |
-|---|---|---|
-| 90 days | ~76% | Too aggressive — flags temporarily inactive users |
-| 180 days | 61% | Workable balance — chosen threshold |
-| 365 days | ~34% | Too lenient — many gone users still labelled retained |
+This stricter definition prevents false positives from short-term vacationers or newly created accounts.
 
-The resulting 61/39 split is handled automatically by `class_weight="balanced"` in the Random Forest.
+### Class Balance
+
+With the current 30-day threshold, the observed class balance is approximately **87% retained / 13% churned** (based on the `notebooks/eda_and_selection.ipynb` analysis). The model uses `class_weight="balanced"` to handle this imbalance automatically. If the churn rate falls outside the 10–90% range, `CHURN_THRESHOLD_DAYS` in `app/features.py` can be adjusted and the model retrained.
 
 ---
 
@@ -155,7 +182,7 @@ Results are summarised in a comparison table in the notebook with keep/drop deci
 
 ## Model
 
-A **Random Forest classifier** (`n_estimators=100`, `class_weight="balanced"`) trained on the 8 engineered features. Evaluated with 5-fold cross-validation reporting accuracy, precision, recall, and F1.
+A **Random Forest classifier** (`n_estimators=100`, `class_weight="balanced"`) trained on the **14 engineered features** listed above. Evaluated with 5-fold cross-validation reporting accuracy, precision, recall, and F1.
 
 To retrain from scratch:
 ```python
@@ -171,7 +198,31 @@ model = train(df, save=True)
 
 ## Data Collection
 
-Data was collected from the GitHub REST API using a spread sampler that queries 6 different points in GitHub's user ID space to avoid sampling bias toward early 2008 accounts:
+Data is collected from both the **GitHub REST API** and the **GraphQL API**. A spread sampler (`get_usernames_spread`) queries 6 different points in GitHub's user ID space to avoid sampling bias toward early 2008 accounts, then fetches full profiles per user.
+
+The scraper gathers these raw fields per user:
+
+| Raw Field | Source | Purpose |
+|---|---|---|
+| `created_at` | REST `/users/{username}` | Account age |
+| `last_activity_at` | REST `updated_at` (fallback if no events) | Overall recency |
+| `last_push_at` | REST `/users/{username}/events/public` (PushEvent) | Recency of code pushes |
+| `last_pr_at` | REST `/users/{username}/events/public` (PullRequestEvent) | Recency of PR activity |
+| `last_issue_at` | REST `/users/{username}/events/public` (IssuesEvent) | Recency of issue activity |
+| `last_comment_at` | REST `/users/{username}/events/public` (IssueCommentEvent) | Recency of comments/reviews |
+| `prs_merged` | Search API `is:merged` | PR success numerator |
+| `prs_opened` | Search API `type:pr` | PR success denominator |
+| `issue_comments` | GraphQL `totalIssueContributions` | Social engagement proxy |
+| `pr_comments` | GraphQL `totalPullRequestReviewContributions` | Social engagement proxy |
+| `total_commits` | GraphQL `totalCommitContributions` | Historical commit volume |
+| `events_30d` | REST `/users/{username}/events/public` (count) | Short-term velocity |
+| `distinct_repos` | GraphQL `*ContributionsByRepository` (union) | Ecosystem breadth |
+| `activity_dates` | REST `/users/{username}/events/public` (all timestamps) | Inactivity streak detection |
+| `org_count` | REST `/users/{username}/orgs` | Professional integration |
+| `ssh_key_count` | REST `/users/{username}/keys` | Security maturity |
+| `gpg_key_count` | REST `/users/{username}/gpg_keys` | Security maturity |
+
+Sampling strategy (avoids early-adopter bias):
 
 ```
 ID 0          → ~2008 founders era
@@ -182,7 +233,11 @@ ID 50,000,000 → ~2017
 ID 100,000,000 → ~2021
 ```
 
-50 users were collected from each checkpoint for a total of 300 profiles.
+150 users are sampled from each checkpoint via `get_usernames_spread()`, for a total of **900** profiles (or as configured in `fetch_all_users`). The script checkpoints progress to `data/raw/users_raw_checkpoint.json` every 50 users so interrupted runs can resume.
+
+**Authentication:** A `GITHUB_TOKEN` in `.env` is strongly recommended. It raises the rate limit from 60 to 5,000 requests/hour and is required for GraphQL data (contributions, distinct repos). Without it, only REST endpoints are available (60 req/hr), making full dataset collection impractical.
+
+**Approximate runtime** (authenticated): ~2–3 hours for 900 users (~8 API calls each, bottleneck is the Search API at 30 req/min).
 
 ---
 
