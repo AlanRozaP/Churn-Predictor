@@ -148,6 +148,8 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
         mature_account
     ).astype(int)
 
+    df.loc[~had_prior_engagement, "churned"] += 2
+
     return df
 
 
@@ -197,10 +199,12 @@ def check_class_balance(y: pd.Series) -> None:
     """
     counts     = y.value_counts()
     churn_rate = counts.get(1, 0) / len(y)
+    dormant_rate = counts.get(2, 0) / len(y)
 
     print("[features] Class balance:")
-    print(f"  Retained (0): {counts.get(0, 0)} ({1 - churn_rate:.1%})")
+    print(f"  Retained (0): {counts.get(0, 0)} ({1 - churn_rate - dormant_rate:.1%})")
     print(f"  Churned  (1): {counts.get(1, 0)} ({churn_rate:.1%})")
+    print(f"  Dormant  (2): {counts.get(2, 0)} ({dormant_rate:.1%})")
 
     if churn_rate < 0.10:
         print("[features] WARNING: Less than 10% churned — lower CHURN_THRESHOLD_DAYS.")

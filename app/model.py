@@ -45,11 +45,12 @@ def train(df: pd.DataFrame, save: bool = True) -> RandomForestClassifier:
     # ── evaluation ────────────────────────────
     y_pred = rf.predict(X_test)
     print("\n[model] Test set performance:")
-    print(classification_report(y_test, y_pred, target_names=["Retained", "Churned"]))
+    print(classification_report(y_test, y_pred, target_names=["Retained", "Churned", "Dormant"]))
 
     cv_results = cross_validate(
         rf, X, y, cv=5,
-        scoring=["accuracy", "f1", "precision", "recall"],
+        # Updated scoring metrics for multiclass classification
+        scoring=["accuracy", "f1_weighted", "precision_weighted", "recall_weighted"],
     )
     print("[model] 5-fold cross-validation:")
     for metric, scores in cv_results.items():
@@ -91,14 +92,16 @@ def load_model() -> RandomForestClassifier:
 
 
 def predict(model: RandomForestClassifier, feature_array: np.ndarray) -> dict:
-    """
-    Runs inference on a pre-built feature array (from features.features_from_dict).
-    Returns a dict with 'churned' (bool) and 'churn_probability' (float).
-    """
-    churn_class   = model.predict(feature_array)[0]
-    churn_prob    = model.predict_proba(feature_array)[0][1]
+    churn_class = int(model.predict(feature_array)[0])
+    probs = model.predict_proba(feature_array)[0]
+    
+    class_map = {0: "Retained", 1: "Churned", 2: "Dormant"}
 
     return {
-        "churned":           bool(churn_class),
-        "churn_probability": round(float(churn_prob), 3),
+        "status": class_map[churn_class],
+        "probabilities": {
+            "retained": round(float(probs[0]), 3),
+            "churned": round(float(probs[1]), 3),
+            "dormant": round(float(probs[2]), 3),
+        }
     }

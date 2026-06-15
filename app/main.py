@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
+from typing import Optional, List
 import numpy as np
 
 from model import load_model, predict
@@ -22,30 +23,73 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Customer Churn Predictor",
-    description="Predicts GitHub user churn using behavioral features.",
-    version="1.0.0",
+    description="Predicts GitHub user churn using 14 behavioral features engineered from GitHub REST + GraphQL APIs.",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 
 # ──────────────────────────────────────────────
 # Request schema — raw GitHub API fields
+# (features.py computes all 14 model features internally)
 # ──────────────────────────────────────────────
 
 class UserInput(BaseModel):
     """
-    Raw GitHub profile fields. The API computes all 8 features internally
-    so callers don't need to pre-compute anything.
+    Raw GitHub profile fields collected by scraper.py.
+    The API computes all 14 engineered features internally via features.py —
+    callers never need to pre-compute anything.
+
+    Required fields:
+        created_at        — ISO timestamp of account creation
+        last_activity_at  — ISO timestamp of most recent public event
+
+    Optional timestamp fields (null → treated as inactive for 60+ days):
+        last_push_at, last_pr_at, last_issue_at, last_comment_at
+
+    Count fields default to 0 when omitted.
     """
-    updated_at:   str   = Field(..., example="2022-03-15T10:00:00Z",
-                                description="ISO timestamp of last GitHub activity (updated_at field)")
-    created_at:   str   = Field(..., example="2018-06-01T08:00:00Z",
-                                description="ISO timestamp of account creation (created_at field)")
-    followers:    int   = Field(0,   ge=0, example=12)
-    following:    int   = Field(0,   ge=0, example=30)
-    public_repos: int   = Field(0,   ge=0, example=5)
-    public_gists: int   = Field(0,   ge=0, example=1)
-    bio:          str | None = Field(None, example="Open source developer")
+    # Required timestamps
+    created_at:       str  = Field(..., example="2018-06-01T08:00:00Z",
+                                   description="ISO timestamp of account creation (created_at field)")
+    last_activity_at: str  = Field(..., example="2022-03-15T10:00:00Z",
+                                   description="ISO timestamp of most recent public event (updated_at fallback)")
+
+    # Per-type last-event timestamps — None means that event type hasn't occurred in the 30d window
+    last_push_at:    Optional[str] = Field(None, example="2022-03-10T08:00:00Z",
+                                           description="ISO timestamp of last PushEvent (null if none in 30d window)")
+    last_pr_at:      Optional[str] = Field(None, example=None,
+                                           description="ISO timestamp of last PullRequestEvent (null if none)")
+    last_issue_at:   Optional[str] = Field(None, example=None,
+                                           description="ISO timestamp of last IssuesEvent (null if none)")
+    last_comment_at: Optional[str] = Field(None, example=None,
+                                           description="ISO timestamp of last IssueCommentEvent (null if none)")
+
+    # PR success fields
+    prs_merged:  int = Field(0, ge=0, example=3,  description="Total merged pull requests (Search API)")
+    prs_opened:  int = Field(0, ge=0, example=5,  description="Total opened pull requests (Search API)")
+
+    # Social engagement fields
+    issue_comments: int = Field(0, ge=0, example=10, description="Total issue contributions (GraphQL)")
+    pr_comments:    int = Field(0, ge=0, example=2,  description="Total PR review contributions (GraphQL)")
+
+    # Commit / activity fields
+    total_commits:  int = Field(0, ge=0, example=100,
+                                description="Total commit contributions in trailing 1-year window (GraphQL)")
+    events_30d:     int = Field(0, ge=0, example=0,
+                                description="Count of all public events in the trailing ~30-day window (REST events API)")
+    distinct_repos: int = Field(0, ge=0, example=4,
+                                description="Number of distinct repos contributed to (GraphQL, union of types)")
+
+    # Activity timeline for inactivity-streak calculation
+    activity_dates: List[str] = Field(default_factory=list,
+                                      example=[],
+                                      description="ISO timestamps of individual events in the 30d window (for streak detection)")
+
+    # Profile structural fields
+    org_count:     int = Field(0, ge=0, example=1, description="Number of organisations the user belongs to")
+    ssh_key_count: int = Field(0, ge=0, example=1, description="Number of SSH public keys on the account")
+    gpg_key_count: int = Field(0, ge=0, example=0, description="Number of GPG keys on the account")
 
 
 # ──────────────────────────────────────────────
@@ -56,7 +100,7 @@ class PredictionResponse(BaseModel):
     churned:           bool
     churn_probability: float
     risk_level:        str
-    features_used:     list[str]
+    features_used:     List[str]
 
 
 # ──────────────────────────────────────────────
@@ -73,29 +117,67 @@ def health():
 def list_features():
     """Returns the feature names and churn threshold the model was trained on."""
     return {
-        "features":              FEATURE_COLUMNS,
-        "churn_threshold_days":  CHURN_THRESHOLD_DAYS,
-        "feature_count":         len(FEATURE_COLUMNS),
+        "features":             FEATURE_COLUMNS,
+        "churn_threshold_days": CHURN_THRESHOLD_DAYS,
+        "feature_count":        len(FEATURE_COLUMNS),
     }
 
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict_churn(user: UserInput):
     """
-    Accepts raw GitHub user fields, computes the 8 behavioral features
-    internally, and returns a churn prediction with probability.
+    Accepts raw GitHub profile fields, computes the 14 behavioral features
+    internally via features.py, and returns a churn prediction with probability.
 
-    Example curl:
+    Risk levels:
+        low    — churn_probability < 0.4
+        medium — churn_probability 0.4–0.69
+        high   — churn_probability >= 0.7
+
+    Example curl (active user):
         curl -X POST http://localhost:8000/predict \\
              -H "Content-Type: application/json" \\
              -d '{
-               "updated_at":   "2022-03-15T10:00:00Z",
-               "created_at":   "2018-06-01T08:00:00Z",
-               "followers":    12,
-               "following":    30,
-               "public_repos": 5,
-               "public_gists": 1,
-               "bio":          "Open source developer"
+               "created_at":       "2018-06-01T08:00:00Z",
+               "last_activity_at": "2024-05-20T10:00:00Z",
+               "last_push_at":     "2024-05-18T08:00:00Z",
+               "last_pr_at":       null,
+               "last_issue_at":    null,
+               "last_comment_at":  null,
+               "prs_merged":       12,
+               "prs_opened":       15,
+               "issue_comments":   40,
+               "pr_comments":      8,
+               "total_commits":    300,
+               "events_30d":       22,
+               "distinct_repos":   7,
+               "activity_dates":   ["2024-05-01T00:00:00Z","2024-05-10T00:00:00Z"],
+               "org_count":        2,
+               "ssh_key_count":    1,
+               "gpg_key_count":    1
+             }'
+
+    Example curl (churned user):
+        curl -X POST http://localhost:8000/predict \\
+             -H "Content-Type: application/json" \\
+             -d '{
+               "created_at":       "2018-01-01T00:00:00Z",
+               "last_activity_at": "2022-01-01T00:00:00Z",
+               "last_push_at":     "2022-01-01T00:00:00Z",
+               "last_pr_at":       null,
+               "last_issue_at":    null,
+               "last_comment_at":  null,
+               "prs_merged":       3,
+               "prs_opened":       5,
+               "issue_comments":   10,
+               "pr_comments":      2,
+               "total_commits":    100,
+               "events_30d":       0,
+               "distinct_repos":   4,
+               "activity_dates":   [],
+               "org_count":        1,
+               "ssh_key_count":    1,
+               "gpg_key_count":    0
              }'
     """
     try:
