@@ -6,3 +6,4 @@ __pycache__
 notebooks/eda_and_selection.txt
 .gitignore
 notebooks/old_eda_and_selection.ipynb
+pdfs
