@@ -536,7 +536,7 @@ def load_raw_data(path: str = "data/raw/users_raw.json") -> pd.DataFrame:
 if __name__ == "__main__":
     os.makedirs("../data/raw", exist_ok=True)
 
-    df = fetch_all_users(count=90)
+    df = fetch_all_users(count=600)
 
     output_path = "../data/raw/users_raw.json"
     df.to_json(output_path, orient="records", indent=2)
