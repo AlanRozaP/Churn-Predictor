@@ -8,16 +8,23 @@ FEATURE_COLUMNS = [
     "pr_success_rate",
     "social_engagement_ratio",
     "recency_gap",
+    "recency_gap_push",
+    "recency_gap_pr",
+    "recency_gap_issue",
+    "recency_gap_comment",
     "max_inactivity_streak",
     "recent_velocity",
+    "commit_velocity_1y",
+    "velocity_drop",
     "repo_density",
     "is_org_member",
     "has_secure_profile",
 ]
 
-# A user is considered churned if they have had zero contributions
-# of any type (pushes, PRs, comments, issues) for this many days.
-CHURN_THRESHOLD_DAYS = 90
+# A user is considered churned if they have had zero public events
+# of any type in the last ~30 days. Because the GitHub public events API
+# only guarantees ~30 days of history, we align the threshold to the data.
+CHURN_THRESHOLD_DAYS = 30
 
 
 # ──────────────────────────────────────────────
@@ -31,64 +38,12 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     Output: DataFrame with FEATURE_COLUMNS + 'churned' label
 
     Expected raw columns from scraper.py:
-        created_at          str  — ISO timestamp of account creation
-                                   Source: GET /users/{username} → created_at
-
-        last_activity_at    str  — ISO timestamp of the user's most recent
-                                   contribution of ANY type (push, PR, comment,
-                                   issue, review). Should be the max timestamp
-                                   across all event sources.
-                                   Source: GET /users/{username}/events/public
-                                           → max(created_at)
-
-        prs_merged          int  — Total merged pull requests authored
-                                   Source: GET /search/issues
-                                           ?q=author:{u}+type:pr+is:merged
-
-        prs_opened          int  — Total pull requests opened (all states)
-                                   Source: GET /search/issues
-                                           ?q=author:{u}+type:pr
-
-        issue_comments      int  — Total issue comments authored
-                                   Source: GET /search/issues
-                                           ?q=commenter:{u}+type:issue
-
-        pr_comments         int  — Total PR review / inline comments authored
-                                   Source: GET /repos/.../pulls/comments
-                                           filtered by user, aggregated
-
-        total_commits       int  — Total commits across all repos (public)
-                                   Source: GraphQL contributionsCollection
-                                           → totalCommitContributions
-
-        events_90d          int  — Count of ALL public events in the trailing
-                                   90 days of the observation window
-                                   Source: GET /users/{username}/events/public
-                                           filtered to last 90 days
-
-        distinct_repos      int  — Count of unique repos the user has
-                                   contributed to (commits, PRs, issues, reviews)
-                                   Source: GraphQL contributionsCollection
-                                           → commitContributionsByRepository
-                                           (count distinct repoNameWithOwner)
-
-        activity_dates      list[str] — ISO date strings of every individual
-                                        activity event within the observation
-                                        window. Used to compute the maximum
-                                        inactivity streak.
-                                        Source: GET /users/{username}/events/public
-                                                → [e["created_at"] for e in events]
-
-        org_count           int  — Number of GitHub organizations the user
-                                   belongs to
-                                   Source: GET /users/{username}/orgs → len(...)
-
-        ssh_key_count       int  — Number of public SSH keys on the account
-                                   Source: GET /users/{username}/keys → len(...)
-
-        gpg_key_count       int  — Number of GPG keys on the account
-                                   Source: GET /user/gpg_keys → len(...)
-                                   (requires authenticated scope)
+        created_at, last_activity_at,
+        last_push_at, last_pr_at, last_issue_at, last_comment_at,
+        prs_merged, prs_opened,
+        issue_comments, pr_comments, total_commits,
+        events_30d, distinct_repos, activity_dates,
+        org_count, ssh_key_count, gpg_key_count
     """
     df = df.copy()
     now = datetime.now(timezone.utc)
@@ -96,6 +51,12 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     # ── parse timestamps ──────────────────────
     df["last_activity"] = pd.to_datetime(df["last_activity_at"], utc=True)
     df["created"]       = pd.to_datetime(df["created_at"],       utc=True)
+
+    # Parse per-type last-activity timestamps (None → NaT)
+    df["last_push"]    = pd.to_datetime(df.get("last_push_at"),    utc=True, errors="coerce")
+    df["last_pr"]      = pd.to_datetime(df.get("last_pr_at"),      utc=True, errors="coerce")
+    df["last_issue"]   = pd.to_datetime(df.get("last_issue_at"),   utc=True, errors="coerce")
+    df["last_comment"] = pd.to_datetime(df.get("last_comment_at"), utc=True, errors="coerce")
 
     # ── account age ───────────────────────────
     df["account_age_days"]  = (now - df["created"]).dt.days
@@ -114,18 +75,41 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── 2. time-based features ────────────────
 
-    # Primary distance from the observation end; Δt_recency in the spec
+    # Primary distance from the observation end
     df["recency_gap"] = (now - df["last_activity"]).dt.days
 
-    # Longest consecutive gap between any two activity events;
-    # users near 30–45 days are structurally at risk of breaching 90 days
+    # Per-type recency gaps.
+    # If a specific event type is missing from the ~30-day window, we know the
+    # true gap is at least 30 days. For already-inactive users we fall back to
+    # the overall gap so the model sees consistency.
+    def _type_gap(series: pd.Series) -> pd.Series:
+        gap = (now - series).dt.days
+        return gap.fillna(60)
+
+    df["recency_gap_push"]    = _type_gap(df["last_push"])
+    df["recency_gap_pr"]      = _type_gap(df["last_pr"])
+    df["recency_gap_issue"]   = _type_gap(df["last_issue"])
+    df["recency_gap_comment"] = _type_gap(df["last_comment"])
+
+    # Longest consecutive gap between any two activity events
     df["max_inactivity_streak"] = df["activity_dates"].apply(_compute_max_streak)
+
+
 
     # ── 3. aggregation features ───────────────
 
-    # Sum of all events in the trailing 90-day window;
-    # a steep decline signals a systematic wind-down
-    df["recent_velocity"] = df["events_90d"]
+    # Sum of all events in the trailing ~30-day window
+    df["recent_velocity"] = df["events_30d"]
+
+    # Historical commit pace over the trailing 1-year GraphQL window.
+    # This establishes a baseline "normal" activity level for the user.
+    df["commit_velocity_1y"] = df["total_commits"] / 365.0
+
+    # Deceleration: positive values mean recent activity is BELOW historical
+    # baseline; large positive values are strong churn signals.
+    # (events_30d / 30) approximates their recent all-event daily pace.
+    df["velocity_drop"] = df["commit_velocity_1y"] - (df["events_30d"] / 30.0)
+
 
     # Distinct repos / account_age_years; diverse anchors reduce churn risk
     df["repo_density"] = df["distinct_repos"] / (df["account_age_years"] + 0.01)
@@ -135,16 +119,34 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     # Org membership implies team/professional obligations → lower churn risk
     df["is_org_member"] = (df["org_count"] > 0).astype(int)
 
-    # SSH/GPG keys proxy development maturity; treats platform as core workstation
+    # SSH/GPG keys proxy development maturity
     df["has_secure_profile"] = (
         (df["ssh_key_count"] + df["gpg_key_count"]) > 0
     ).astype(int)
 
     # ── churn label ───────────────────────────
-    # A user is churned if they have gone 90+ days without ANY contribution:
-    # pushes, PRs, issue/PR comments, reviews — anything surfaced in the
-    # public events feed or contribution graph.
-    df["churned"] = (df["recency_gap"] > CHURN_THRESHOLD_DAYS).astype(int)
+    # A user is churned only if they were historically active but have gone
+    # 30+ days without ANY public event. This prevents labeling dormant
+    # accounts and short-term vacationers as churned.
+    #
+    # Historical engagement is proven by 1-year GraphQL aggregates or all-time
+    # PR counts — signals that the user once treated GitHub as a workstation.
+    had_prior_engagement = (
+        (df["total_commits"] > 0) |
+        (df["prs_opened"] > 0) |
+        (df["issue_comments"] > 0) |
+        (df["distinct_repos"] > 0)
+    )
+
+    # Also require the account to be older than the threshold so brand-new
+    # signups with zero activity aren't misclassified.
+    mature_account = df["account_age_days"] > CHURN_THRESHOLD_DAYS
+
+    df["churned"] = (
+        (df["recency_gap"] > CHURN_THRESHOLD_DAYS) &
+        had_prior_engagement &
+        mature_account
+    ).astype(int)
 
     return df
 
@@ -213,29 +215,40 @@ def features_from_dict(data: dict) -> np.ndarray:
     Converts a single user's raw field dictionary into a feature array
     ready for model.predict(). Used by the FastAPI /predict endpoint.
 
-    Expected keys — see generate_features() docstring for field descriptions
-    and their GitHub API sources:
+    Expected keys:
         created_at, last_activity_at,
+        last_push_at, last_pr_at, last_issue_at, last_comment_at,
         prs_merged, prs_opened,
         issue_comments, pr_comments, total_commits,
-        events_90d, distinct_repos, activity_dates,
+        events_30d, distinct_repos, activity_dates,
         org_count, ssh_key_count, gpg_key_count
     """
     now = datetime.now(timezone.utc)
 
-    last_activity     = pd.to_datetime(data["last_activity_at"], utc=True)
-    created           = pd.to_datetime(data["created_at"],       utc=True)
+    last_activity = pd.to_datetime(data["last_activity_at"], utc=True)
+    created       = pd.to_datetime(data["created_at"],       utc=True)
+
+    # Parse per-type timestamps (None / missing → NaT)
+    last_push    = pd.to_datetime(data.get("last_push_at"),    utc=True, errors="coerce")
+    last_pr      = pd.to_datetime(data.get("last_pr_at"),      utc=True, errors="coerce")
+    last_issue   = pd.to_datetime(data.get("last_issue_at"),   utc=True, errors="coerce")
+    last_comment = pd.to_datetime(data.get("last_comment_at"), utc=True, errors="coerce")
 
     recency_gap       = (now - last_activity).days
     account_age_days  = (now - created).days
     account_age_years = account_age_days / 365.0
+
+    def _gap(ts):
+        if pd.isna(ts):
+            return max(recency_gap, 30)
+        return (now - ts).days
 
     prs_merged     = data.get("prs_merged",     0)
     prs_opened     = data.get("prs_opened",     0)
     issue_comments = data.get("issue_comments", 0)
     pr_comments    = data.get("pr_comments",    0)
     total_commits  = data.get("total_commits",  0)
-    events_90d     = data.get("events_90d",     0)
+    events_30d     = data.get("events_30d",     0)
     distinct_repos = data.get("distinct_repos", 0)
     activity_dates = data.get("activity_dates", [])
     org_count      = data.get("org_count",      0)
@@ -244,15 +257,24 @@ def features_from_dict(data: dict) -> np.ndarray:
 
     total_social = issue_comments + pr_comments
 
+    commits_per_day_1y = total_commits / 365.0
+    events_per_day_30d = events_30d / 30.0
+
     feature_vector = [
         # 1. ratio features
         prs_merged / (prs_opened + 1),                              # pr_success_rate
         total_social / (total_commits + total_social + 1),          # social_engagement_ratio
         # 2. time-based features
         recency_gap,                                                 # recency_gap
+        _gap(last_push),                                             # recency_gap_push
+        _gap(last_pr),                                               # recency_gap_pr
+        _gap(last_issue),                                            # recency_gap_issue
+        _gap(last_comment),                                          # recency_gap_comment
         _compute_max_streak(activity_dates),                         # max_inactivity_streak
         # 3. aggregation features
-        events_90d,                                                  # recent_velocity
+        events_30d,                                                  # recent_velocity
+        commits_per_day_1y,                                         # commit_velocity_1y
+        commits_per_day_1y - events_per_day_30d,                   # velocity_drop
         distinct_repos / (account_age_years + 0.01),                # repo_density
         # 4. binary features
         int(org_count > 0),                                         # is_org_member

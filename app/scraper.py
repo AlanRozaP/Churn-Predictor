@@ -241,20 +241,34 @@ def _fetch_pr_counts(username: str) -> tuple[int, int]:
     return prs_opened, prs_merged
 
 
-def _fetch_events(username: str) -> tuple[str | None, int, list[str]]:
+def _fetch_events(username: str) -> tuple[str | None, int, list[str], dict[str, str | None]]:
     """
     Fetches up to 300 public events (GitHub's hard cap) for the user.
-    GitHub guarantees all events are within the last 90 days, so:
-        events_90d     = total event count returned
+    GitHub's public events API returns at most the last ~30 days of activity,
+    so:
+        events_30d     = total event count returned
         activity_dates = list of all event ISO timestamps
         last_activity_at = max(activity_dates)
 
-    Uses per_page=100 to minimise API calls (3 pages × 100 = 300 events).
+    Uses per_page=100 to minimise API calls (3 pages × 100 = 300 events max).
 
-    If no events are found (user has been inactive for > 90 days), returns
-    (None, 0, []) — the caller falls back to profile-level updated_at.
+    Tracks the 4 most important public event types:
+        PushEvent          → last_push_at
+        PullRequestEvent   → last_pr_at
+        IssuesEvent        → last_issue_at
+        IssueCommentEvent  → last_comment_at
+
+    If no events are found (user has been inactive for > 30 days), returns
+    (None, 0, [], {}) — the caller falls back to profile-level updated_at.
     """
     all_dates: list[str] = []
+    # Track the latest timestamp seen for each of the 4 key event types
+    type_latest: dict[str, str | None] = {
+        "PushEvent":         None,
+        "PullRequestEvent":  None,
+        "IssuesEvent":       None,
+        "IssueCommentEvent": None,
+    }
 
     for page in range(1, 4):  # 3 pages × 100 = 300 events max
         r = _get(
@@ -269,7 +283,20 @@ def _fetch_events(username: str) -> tuple[str | None, int, list[str]]:
         if not batch:
             break
 
-        all_dates.extend(e["created_at"] for e in batch if e.get("created_at"))
+        for event in batch:
+            created_at = event.get("created_at")
+            event_type = event.get("type")
+
+            if not created_at:
+                continue
+
+            all_dates.append(created_at)
+
+            # Update per-type tracker if this event is one of the 4 we care about
+            if event_type in type_latest:
+                # Keep the most recent (lexicographic ISO comparison works for timestamps)
+                if type_latest[event_type] is None or created_at > type_latest[event_type]:
+                    type_latest[event_type] = created_at
 
         if len(batch) < 100:  # last page reached
             break
@@ -277,9 +304,10 @@ def _fetch_events(username: str) -> tuple[str | None, int, list[str]]:
         time.sleep(0.3)
 
     if not all_dates:
-        return None, 0, []
+        return None, 0, [], {}
 
-    return max(all_dates), len(all_dates), all_dates
+    return max(all_dates), len(all_dates), all_dates, type_latest
+
 
 
 def _fetch_org_count(username: str) -> int:
@@ -382,19 +410,11 @@ def get_usernames_spread(total: int = 900) -> list[str]:
 def fetch_user_profile(username: str) -> dict | None:
     """
     Fetches all raw fields required by features.py for a single user.
-    Makes up to 8 API calls per user:
+    Makes up to 8 API calls per user.
 
-        Call  Endpoint                              Fields produced
-        ────  ──────────────────────────────────    ─────────────────────────────────────
-        1     GET /users/{username}                 created_at
-        2     POST /graphql (1-year window)         total_commits, issue_comments,
-                                                    pr_comments, distinct_repos
-        3     GET /search/issues (×2)               prs_opened, prs_merged  (all-time)
-        4     GET /users/{u}/events/public (×1-3)   last_activity_at, events_90d,
-                                                    activity_dates
-        5     GET /users/{u}/orgs                   org_count
-        6     GET /users/{u}/keys                   ssh_key_count
-        7     GET /users/{u}/gpg_keys               gpg_key_count
+    NEW fields added:
+        last_push_at, last_pr_at, last_issue_at, last_comment_at
+        (most recent timestamp for each of the 4 key public event types)
 
     Returns None if the base profile fetch fails or created_at is missing.
     """
@@ -417,12 +437,24 @@ def fetch_user_profile(username: str) -> dict | None:
     prs_opened, prs_merged = _fetch_pr_counts(username)
     # _fetch_pr_counts already sleeps 2.1s between its two calls
 
-    # ── 4. events (last 90 days, max 300) ─────────────────────────────────
-    last_activity_at, events_90d, activity_dates = _fetch_events(username)
+     # ── 4. events (last ~30 days, max 300) ─────────────────────────────────
+    last_activity_at, events_30d, activity_dates, last_by_type = _fetch_events(username)
+
     if not last_activity_at:
-        # No public events in 90 days — user is almost certainly churned.
+        # No public events in the last ~30 days.
         # Fall back to profile-level updated_at as the best available signal.
+        # NOTE: updated_at includes non-code activity (profile edits), so it is
+        # an imperfect proxy. The feature pipeline handles this by also checking
+        # events_30d == 0 when computing the churn label.
         last_activity_at = profile.get("updated_at")
+
+
+    # Extract per-type timestamps (None if that event type never occurred in the 30d window)
+    last_push_at    = last_by_type.get("PushEvent")
+    last_pr_at      = last_by_type.get("PullRequestEvent")
+    last_issue_at   = last_by_type.get("IssuesEvent")
+    last_comment_at = last_by_type.get("IssueCommentEvent")
+
     time.sleep(0.2)
 
     # ── 5. org membership ─────────────────────────────────────────────────
@@ -437,6 +469,11 @@ def fetch_user_profile(username: str) -> dict | None:
         # ── timestamps ───────────────────────────────────────────────────
         "created_at":       created_at,        # → account_age_days / account_age_years
         "last_activity_at": last_activity_at,  # → recency_gap
+        # ── NEW: per-event-type recency ──────────────────────────────────
+        "last_push_at":     last_push_at,      # → recency_gap_push
+        "last_pr_at":       last_pr_at,        # → recency_gap_pr
+        "last_issue_at":    last_issue_at,     # → recency_gap_issue
+        "last_comment_at":  last_comment_at,   # → recency_gap_comment
         # ── PR features ──────────────────────────────────────────────────
         "prs_merged":       prs_merged,        # → pr_success_rate numerator
         "prs_opened":       prs_opened,        # → pr_success_rate denominator
@@ -445,7 +482,7 @@ def fetch_user_profile(username: str) -> dict | None:
         "pr_comments":      contribs["pr_comments"],     # → social_engagement_ratio
         "total_commits":    contribs["total_commits"],   # → social_engagement_ratio
         # ── activity features ─────────────────────────────────────────────
-        "events_90d":       events_90d,        # → recent_velocity
+        "events_30d":       events_30d,        # → recent_velocity
         "distinct_repos":   contribs["distinct_repos"],  # → repo_density
         "activity_dates":   activity_dates,    # → max_inactivity_streak
         # ── structural features ───────────────────────────────────────────
@@ -536,7 +573,7 @@ def load_raw_data(path: str = "data/raw/users_raw.json") -> pd.DataFrame:
 if __name__ == "__main__":
     os.makedirs("../data/raw", exist_ok=True)
 
-    df = fetch_all_users(count=600)
+    df = fetch_all_users(count=400)
 
     output_path = "../data/raw/users_raw.json"
     df.to_json(output_path, orient="records", indent=2)
